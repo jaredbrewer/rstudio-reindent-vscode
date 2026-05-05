@@ -537,6 +537,11 @@ export function reindentLines(
   // continuation operator. Blank lines clear it (hard boundary); comments
   // pass through unchanged (transparent).
   const prevIdxAtDepth = new Map<number, number>();
+  // Last real-line index keyed by the depth the line BEGAN at (before its own
+  // tokens). Used to align comment lines with a leading-op chain at the same
+  // start depth: a closing-bracket-only line ends at a shallower depth but
+  // shouldn't be the anchor for a later comment in the outer scope.
+  const prevStartIdxAtDepth = new Map<number, number>();
   // Index of the root line of an active top-level chain, or -1. A chain opens
   // on the first line that ends at top-level with a continuation op; it stays
   // open across bracketed blocks (e.g. `} %>%`) and closes when a top-level
@@ -567,6 +572,7 @@ export function reindentLines(
     // bracket tokens on this line change the stack. This frame is where we
     // record prevArgLine for defer-to-prev logic on subsequent lines.
     const startOwner = stack.length > 0 ? stack[stack.length - 1] : null;
+    const startDepth = stack.length;
 
     // ── Compute desired indent ───────────────────────────────────────────────
     let newLine: string;
@@ -624,6 +630,17 @@ export function reindentLines(
         } else {
           desired = owner?.lineIndent ?? '';
         }
+
+      // Comment line whose previous same-start-depth real line was a
+      // leading-op continuation: comments are transparent within a chain
+      // and inherit its running indent rather than vertical-aligning under
+      // the opener. Without this, a comment between two `|>` lines inside
+      // `(pipe …)` would land at col+1 instead of with the chain.
+      } else if (owner !== null && stripped.startsWith('#')
+                 && prevStartIdxAtDepth.has(startDepth)
+                 && startsWithLeadingOp(
+                      result[prevStartIdxAtDepth.get(startDepth)!].trimStart())) {
+        desired = getLineIndent(result[prevStartIdxAtDepth.get(startDepth)!]);
 
       // Inside a bracket — vertical align or tab-stop
       } else if (owner !== null) {
@@ -683,9 +700,13 @@ export function reindentLines(
           //     (lineIndent+tab) regardless of hanging.
           if (owner.isCall && owner.hanging) {
             desired = owner.lineIndent + tab + tab;
-          } else if (owner.openedOnLeadingOpLine || owner.isCall) {
+          } else if (owner.isCall) {
             desired = ' '.repeat(owner.col) + tab;
           } else {
+            // Grouping `(`: leading-op continuations anchor to the surrounding
+            // scope (lineIndent+tab), regardless of whether the `(` itself
+            // appeared on a leading-op line — the inside of the group is a
+            // fresh scope, not a continuation of the outer chain.
             desired = owner.lineIndent + tab;
           }
         } else if (idx - 1 === owner.lineNo) {
@@ -872,12 +893,14 @@ export function reindentLines(
     // statement, so they don't update arg-tracking either.
     if (stripped === '') {
       prevIdxAtDepth.clear();
+      prevStartIdxAtDepth.clear();
       // Blank lines also reset every frame's defer anchor — a blank line is
       // a hard continuation boundary, so a later arg should re-align against
       // the opener rather than inheriting some pre-blank sibling's indent.
       for (const f of stack) f.prevArgLine = undefined;
     } else if (!stripped.startsWith('#') && !inString) {
       prevIdxAtDepth.set(stack.length, idx);
+      prevStartIdxAtDepth.set(startDepth, idx);
       // Record this line as the previous-arg of the frame that owned us when
       // the line began. Lines starting at top level have no owner. Comments
       // are transparent and skipped.
